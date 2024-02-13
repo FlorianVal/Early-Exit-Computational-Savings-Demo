@@ -25,23 +25,8 @@ def reset():
     _, st.session_state['logits'], _, st.session_state['head_tokens'] = generate_next_token(st.session_state.model, st.session_state.tokenizer, st.session_state['current_sentence'])
 
 @st.cache_resource
-def load_model(penalty_alpha):
-    penalty_map = {0.1:"model_20240118-144039.bin", 
-               0.5:"model_20240118-192548.bin", 
-               2:"model_20240118-211943.bin", 
-               5:"model_20240118-231333.bin",
-               10:"model_20240119-010725.bin", 
-               20:"model_20240119-030115.bin", 
-               0:"model_20240119-135506.bin", 
-               1:"model_20240119-154900.bin",
-               -20: "model_20240208-072350.bin",
-               -10: "model_20240208-052958.bin",
-               -5: "model_20240208-033606.bin",
-               -2: "model_20240208-014211.bin",
-               -1: "model_20240207-234817.bin",
-               -0.5: "model_20240207-215423.bin",
-               -0.1: "model_20240207-200020.bin"}
-    
+def load_model(model_path):
+
     model_str = "susnato/phi-1_5_dev"
     model = AutoModelForCausalLM.from_pretrained(model_str).to("cuda:1")
     tokenizer = AutoTokenizer.from_pretrained(model_str)
@@ -49,19 +34,15 @@ def load_model(penalty_alpha):
     branch_locations = list(range(0, 23, 5))
     model = BranchyModel(branch_locations= branch_locations, model= model).to("cuda:1")
 
-    # Load the specific model based on penalty_alpha
-    model_path = penalty_map.get(penalty_alpha)
-    if model_path:
-        model.load_state_dict(torch.load(model_path, map_location="cuda:1"))
-    else:
-        print("Invalid penalty_alpha. Using default model weights.")
+    # Load the specific model
+    model.load_state_dict(torch.load(model_path, map_location="cuda:1"))
 
     return model, tokenizer
 
 
 if "model" not in st.session_state or "tokenizer" not in st.session_state:
     print("Loading model...")
-    st.session_state.model, st.session_state.tokenizer = load_model(penalty_alpha=-2)  # Example penalty_alpha
+    st.session_state.model, st.session_state.tokenizer = load_model("model/model.bin")
     st.session_state["head_number"] = len(st.session_state.model.branch_locations) + 1
     print(f"Head number: {st.session_state['head_number']}")
 # Session state to store the current sentence
