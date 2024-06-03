@@ -1,0 +1,5 @@
+streamlit==1.31.0
+torch==2.0.1
+pandas==2.0.3
+transformers==4.36.0
+st-annotated-text
