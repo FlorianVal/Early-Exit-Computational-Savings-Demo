@@ -35,5 +35,3 @@ The command will start a local web server and open the application in your defau
 - **app.py**: The main Streamlit application script.
 - **requirements.txt**: Lists all the Python dependencies required by the project.
 - **src/**: Contains the source code for the project.
-- **BranchyModel.py**: Defines the BranchyModel with early exit points.
-- **utils.py**: Provides utility functions for data processing and evaluation.
