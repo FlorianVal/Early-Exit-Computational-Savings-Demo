@@ -3,7 +3,10 @@ import time
 import streamlit as st
 import torch
 import pandas as pd
+import plotly.graph_objects as go
+import numpy as np
 
+from plotly.subplots import make_subplots
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typer import clear
 from annotated_text import annotated_text
@@ -24,14 +27,14 @@ def annotated_to_normal(text):
             result += elem
     return result
 
-def generate_next_token():
+def generate_next_token(device="cpu"):
     print(f"Generating next token from {st.session_state.messages}")
     inputs = ""
     for message in st.session_state.messages:
         inputs += message["role"] + ": " + annotated_to_normal(message["content"]) + "\n"
     inputs += "Assistant:"
     print(f"Inputs: {inputs}")
-    inputs = st.session_state.tokenizer.encode(inputs, return_tensors="pt")
+    inputs = st.session_state.tokenizer.encode(inputs, return_tensors="pt").to(device)
     for i in range(50):
         start = time.time()
         outputs = st.session_state.model(inputs)
@@ -51,25 +54,26 @@ def generate_next_token():
             print(sorted(branch_locations, reverse=True))
             early_exit = (branch_locations.index(outputs.head_indices) + 1) / len(branch_locations)
         else:
-            early_exit = 0
+            early_exit = 1.25
         # Add data to dataframe
         new_row = pd.DataFrame({"Time taken (in ms)": [time_taken], "Early exit depth": [early_exit]})
         st.session_state.data = pd.concat([st.session_state.data, new_row], ignore_index=True)
         yield next_token, early_exit
 
 @st.cache_resource
-def load_model(model_str, tokenizer_str):
-    model = AutoModelForCausalLM.from_pretrained(model_str, trust_remote_code=True)
+def load_model(model_str, tokenizer_str, device="cpu"):
+    model = AutoModelForCausalLM.from_pretrained(model_str, trust_remote_code=True).to(device)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_str)
     return model, tokenizer
 
 model_str = "valcore/Branchy-Phi-2"
 tokenizer_str = "microsoft/Phi-2"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 if "model" not in st.session_state or "tokenizer" not in st.session_state:
-    print("Loading model...")
-    st.session_state.model, st.session_state.tokenizer = load_model(model_str, tokenizer_str)
+    print(f"Loading model on {device}")
+    st.session_state.model, st.session_state.tokenizer = load_model(model_str, tokenizer_str, device)
 
 # Initialize chat history and dataframe
 if "messages" not in st.session_state:
@@ -109,8 +113,8 @@ with col2:
         with st.chat_message("Assistant"):
             response = []
             with st.spinner('Running inference...'):
-                for next_token, early_exit in generate_next_token():
-                    if early_exit > 0.0:
+                for next_token, early_exit in generate_next_token(device):
+                    if early_exit > 0.0 and early_exit != 1.25:
                         response.append(tuple((next_token, str(early_exit))))
                     else:
                         response.append(next_token)
@@ -119,5 +123,54 @@ with col2:
 
         # Add assistant response to chat history
         st.session_state.messages.append({"role": "Assistant", "content": response})
-        st.line_chart(st.session_state.data, x=None, y=["Time taken (in ms)", "Early exit depth"])
+
+        # Assuming st.session_state.data is a pandas DataFrame
+        df = st.session_state.data
+
+        # Calculate the max time taken and add a 10% margin
+        max_time = df["Time taken (in ms)"].max()
+        time_axis_max = max_time * 1.1  # 10% margin
+
+
+        # Create figure with secondary y-axis
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # Add traces
+        fig.add_trace(
+            go.Scatter(x=df.index, y=df["Time taken (in ms)"], name="Time taken (in ms)"),
+            secondary_y=False,
+        )
+
+        fig.add_trace(
+            go.Scatter(x=df.index, y=df["Early exit depth"], name="Early exit depth"),
+            secondary_y=True,
+        )
+
+        # Set x-axis title
+        fig.update_xaxes(title_text="Index")
+
+        # Set y-axes titles
+        fig.update_yaxes(
+            title_text="Time taken (in ms)", 
+            secondary_y=False,
+            range=[0, time_axis_max],
+            tickmode='linear',
+            dtick=np.ceil(time_axis_max / 5 / 10) * 10  # Round to nearest 10
+        )
+        fig.update_yaxes(
+            title_text="Early exit depth", 
+            secondary_y=True, 
+            range=[0, 1.25],
+            tickmode='linear',
+            dtick=0.25
+        )
+        
+        fig.update_layout(
+            title_text="Time Taken vs Early Exit Depth",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        # Use Streamlit to display the Plotly chart
+        st.plotly_chart(fig)
+        
+        #st.line_chart(st.session_state.data, x=None, y=["Time taken (in ms)", "Early exit depth"])
         print(st.session_state.messages)
