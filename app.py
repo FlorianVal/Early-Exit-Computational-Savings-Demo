@@ -1,176 +1,145 @@
-# Save this as app.py and run with `streamlit run app.py`
-import time
-import streamlit as st
+import gradio as gr
 import torch
 import pandas as pd
 import plotly.graph_objects as go
-import numpy as np
-
 from plotly.subplots import make_subplots
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typer import clear
-from annotated_text import annotated_text
+import time
+import numpy as np
 
-st.title("Multi-Head LLM Demo")
-st.markdown("""This is a demo of a multi-head language model with early exit capabilities. 
-            The model is based on the Phi-2 architecture and model is available here : https://huggingface.co/valcore/Branchy-Phi-2.
-            \nThe model has four heads, each of which can be exited early based on a threshold. The graph show the depth of early exit for each token (the deeper being the faster) and the time taken to generate each token.
-            Early exited tokens are annotated with the depth of early exit (with a float smaller than 1, 1 being the deepest)
-            """)
-
-def annotated_to_normal(text):
-    result = ""
-    for elem in text:
-        if isinstance(elem, tuple):
-            result += elem[0]
-        else:
-            result += elem
-    return result
-
-def generate_next_token(device="cpu"):
-    print(f"Generating next token from {st.session_state.messages}")
-    inputs = ""
-    for message in st.session_state.messages:
-        inputs += message["role"] + ": " + annotated_to_normal(message["content"]) + "\n"
-    inputs += "Assistant:"
-    print(f"Inputs: {inputs}")
-    inputs = st.session_state.tokenizer.encode(inputs, return_tensors="pt").to(device)
-    for i in range(50):
-        start = time.time()
-        outputs = st.session_state.model(inputs)
-        stop = time.time()
-        next_token_logits = outputs.logits[:, -1, :].squeeze()
-        next_token_probs = torch.softmax(next_token_logits, dim=-1)
-        next_token_id = torch.argmax(next_token_probs, dim=-1)
-        if next_token_id == 50256:
-            break
-        print(inputs.shape, next_token_id.shape)
-        inputs = torch.cat([inputs, next_token_id.unsqueeze(0).unsqueeze(-1)], dim=-1)
-        next_token = st.session_state.tokenizer.decode(next_token_id, return_tensors="pt")
-        time_taken = stop - start
-        branch_locations = st.session_state.model.config.branch_locations
-        print(outputs.head_indices)
-        if outputs.head_indices in branch_locations:
-            print(sorted(branch_locations, reverse=True))
-            early_exit = (branch_locations.index(outputs.head_indices) + 1) / len(branch_locations)
-        else:
-            early_exit = 1.25
-        # Add data to dataframe
-        new_row = pd.DataFrame({"Time taken (in ms)": [time_taken], "Early exit depth": [early_exit]})
-        st.session_state.data = pd.concat([st.session_state.data, new_row], ignore_index=True)
-        yield next_token, early_exit
-
-@st.cache_resource
-def load_model(model_str, tokenizer_str, device="cpu"):
-    model = AutoModelForCausalLM.from_pretrained(model_str, trust_remote_code=True).to(device)
-    model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_str)
-    return model, tokenizer
-
+# Load the model and tokenizer
 model_str = "valcore/Branchy-Phi-2"
 tokenizer_str = "microsoft/Phi-2"
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-if "model" not in st.session_state or "tokenizer" not in st.session_state:
-    print(f"Loading model on {device}")
-    st.session_state.model, st.session_state.tokenizer = load_model(model_str, tokenizer_str, device)
+model = AutoModelForCausalLM.from_pretrained(model_str, trust_remote_code=True).to(device)
+tokenizer = AutoTokenizer.from_pretrained(tokenizer_str)
 
-# Initialize chat history and dataframe
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-st.session_state.data = pd.DataFrame(columns=["Time taken (in ms)", "Early exit depth"])
+# Initialize dataframe for storing token generation data
+data = pd.DataFrame(columns=["Time taken (in ms)", "Early exit depth", "Token"])
 
-col1, col2 = st.columns([1, 4])
+# Define thresholds for different epsilon values
+epsilon_thresholds = {
+    0.4: [1.0307843685150146, 0.8693032264709473, 0.6637287139892578, 0.3111608028411865],
+    0.5: [1.505380630493164, 1.5712471008300781, 1.1971790790557861, 0.6908178329467773],
+    0.6: [2.0270779132843018, 1.8969502449035645, 1.4789371490478516, 0.9875392913818359],
+    0.7: [2.506962537765503, 2.656052589416504, 1.924393653869629, 1.4434680938720703],
+    0.8: [3.3786778450012207, 2.568857192993164, 2.5665550231933594, 2.006620407104492],
+    0.9: [3.187114715576172, 3.442272663116455, 2.636230945587158, 2.460529088973999],
+    1.0: [10.0, 10.0, 10.0, 10.0]  # Effectively disable early exits
+}
 
-with col1:
-    early_exit = st.checkbox("Early exit", value=False)
-    if early_exit:
-        st.session_state.model.head_thresholds = [2.506962537765503, 2.656052589416504, 1.924393653869629, 1.4434680938720703]
-    else:
-        st.session_state.model.head_thresholds = [10., 10., 10., 10.]
-    clear_session = st.button("Clear session")
-    if clear_session:
-        print("Clearing session")
-        st.session_state.messages = []
-        st.session_state.data = pd.DataFrame(columns=["Time taken (in ms)", "Early exit depth"])
+# Global variable to control generation
+stop_generation = False
 
-with col2:
-    # Display chat messages from history on app rerun
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            annotated_text(message["content"])
+def create_plot():
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    fig.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["Time taken (in ms)"],
+            name="Time taken (ms)",
+            text=data["Token"],
+            hovertemplate="<b>Token:</b> %{text}<br><b>Time:</b> %{y:.2f} ms<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    
+    fig.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["Early exit depth"],
+            name="Early exit depth",
+            text=data["Token"],
+            hovertemplate="<b>Token:</b> %{text}<br><b>Depth:</b> %{y:.2f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    
+    fig.update_layout(
+        title_text="Token Generation Metrics",
+        xaxis_title="Token Index",
+        yaxis_title="Time (ms)",
+        yaxis2_title="Exit Depth",
+        hovermode="closest",
+    )
+    
+    fig.update_yaxes(range=[0, 1.1], secondary_y=True)
+    
+    return fig
 
-    prompt = st.chat_input("What is up?")
-    # React to user input
-    if prompt:
-        # Display user message in chat message container
-        with st.chat_message("User"):
-            st.markdown(prompt)
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "User", "content": prompt})
+def truncate_context(input_ids, max_length=2048):
+    if len(input_ids[0]) > max_length:
+        return input_ids[:, -max_length:]
+    return input_ids
 
-        # Display assistant response in chat message container
-        with st.chat_message("Assistant"):
-            response = []
-            with st.spinner('Running inference...'):
-                for next_token, early_exit in generate_next_token(device):
-                    if early_exit > 0.0 and early_exit != 1.25:
-                        response.append(tuple((next_token, str(early_exit))))
-                    else:
-                        response.append(next_token)
-                    print(response)
-            annotated_text(response)
-
-        # Add assistant response to chat history
-        st.session_state.messages.append({"role": "Assistant", "content": response})
-
-        # Assuming st.session_state.data is a pandas DataFrame
-        df = st.session_state.data
-
-        # Calculate the max time taken and add a 10% margin
-        max_time = df["Time taken (in ms)"].max()
-        time_axis_max = max_time * 1.1  # 10% margin
-
-
-        # Create figure with secondary y-axis
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-        # Add traces
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df["Time taken (in ms)"], name="Time taken (in ms)"),
-            secondary_y=False,
-        )
-
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df["Early exit depth"], name="Early exit depth"),
-            secondary_y=True,
-        )
-
-        # Set x-axis title
-        fig.update_xaxes(title_text="Index")
-
-        # Set y-axes titles
-        fig.update_yaxes(
-            title_text="Time taken (in ms)", 
-            secondary_y=False,
-            range=[0, time_axis_max],
-            tickmode='linear',
-            dtick=np.ceil(time_axis_max / 5 / 10) * 10  # Round to nearest 10
-        )
-        fig.update_yaxes(
-            title_text="Early exit depth", 
-            secondary_y=True, 
-            range=[0, 1.25],
-            tickmode='linear',
-            dtick=0.25
-        )
+def generate_response(message, chat_history, epsilon):
+    global data, stop_generation
+    data = pd.DataFrame(columns=["Time taken (in ms)", "Early exit depth", "Token"])
+    stop_generation = False
+    
+    # Set model thresholds based on epsilon
+    model.head_thresholds = torch.tensor(epsilon_thresholds[epsilon])
+    
+    full_response = ""
+    chat_history = chat_history or []
+    inputs = tokenizer.encode(message, return_tensors="pt").to(device)
+    
+    while not stop_generation:
+        inputs = truncate_context(inputs)
+        start = time.time()
+        outputs = model(inputs)
+        stop = time.time()
         
-        fig.update_layout(
-            title_text="Time Taken vs Early Exit Depth",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        # Use Streamlit to display the Plotly chart
-        st.plotly_chart(fig)
+        next_token_logits = outputs.logits[:, -1, :]
+        next_token_id = torch.argmax(next_token_logits, dim=-1)
         
-        #st.line_chart(st.session_state.data, x=None, y=["Time taken (in ms)", "Early exit depth"])
-        print(st.session_state.messages)
+        if next_token_id.item() == tokenizer.eos_token_id:
+            break
+        
+        inputs = torch.cat([inputs, next_token_id.unsqueeze(0)], dim=-1)
+        next_token = tokenizer.decode(next_token_id)
+        full_response += next_token
+        
+        time_taken = (stop - start) * 1000  # Convert to milliseconds
+        branch_locations = model.config.branch_locations
+        early_exit = (branch_locations.index(outputs.head_indices) + 1) / len(branch_locations) if outputs.head_indices in branch_locations else 1.0
+        
+        new_row = pd.DataFrame({
+            "Time taken (in ms)": [time_taken],
+            "Early exit depth": [early_exit],
+            "Token": [next_token]
+        })
+        data = pd.concat([data, new_row], ignore_index=True)
+        
+        new_history = chat_history + [(message, full_response)]
+        yield new_history, new_history, gr.update(value=create_plot())
+
+def stop_gen():
+    global stop_generation
+    stop_generation = True
+    return gr.update(interactive=False)
+
+with gr.Blocks() as demo:
+    gr.Markdown("# Multi-Head LLM Demo with Early Exit Capabilities 🤗")
+    gr.Markdown("""This is a demo of a multi-head language model with early exit capabilities. 
+                The model is based on the Phi-2 architecture and is available here: https://huggingface.co/valcore/Branchy-Phi-2.
+                The model has four heads, each of which can be exited early based on a threshold. The graph shows the depth of early exit for each token and the time taken to generate each token.
+                Use the slider to adjust the early exit threshold. Lower values allow for more early exits, potentially speeding up generation at the cost of accuracy.
+                """)
+    chatbot = gr.Chatbot()
+    msg = gr.Textbox(label="Message")
+    epsilon = gr.Slider(minimum=0.4, maximum=1.0, value=0.7, step=0.1, label="Epsilon")
+    
+    with gr.Row():
+        send = gr.Button("Send")
+        stop = gr.Button("Stop Generation")
+    
+    graph = gr.Plot()
+    
+    send.click(generate_response, inputs=[msg, chatbot, epsilon], outputs=[chatbot, chatbot, graph])
+    msg.submit(generate_response, inputs=[msg, chatbot, epsilon], outputs=[chatbot, chatbot, graph])
+    stop.click(stop_gen, outputs=[stop])
+
+demo.queue().launch()
