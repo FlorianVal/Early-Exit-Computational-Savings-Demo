@@ -3,8 +3,8 @@ title: Branchy Phi 2
 emoji: ⚡
 colorFrom: purple
 colorTo: pink
-sdk: streamlit
-sdk_version: 1.35.0
+sdk: gradio
+sdk_version: 4.36.1
 app_file: app.py
 pinned: false
 ---
